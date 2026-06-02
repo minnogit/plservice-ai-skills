@@ -13,6 +13,7 @@ Before implementing any notification, evaluate the flow in this exact order:
 3. **Are you handling multi-field validation errors simultaneously?** → YES: You MUST use JavaScript with a loop of `showNotification()` calls (FlashMessage only allows one message per type).
 4. **Is it an inline PHP script executed immediately during page parsing?** → YES: Wrap `showNotification()` inside a `DOMContentLoaded` event listener.
 5. **Do you need an immediate page reload/redirect right after the alert?** → YES: Use native JavaScript `confirm()`. `showNotification()` is asynchronous and will vanish instantly.
+6. **Do you want to log a technical detail for ops?** → YES: ALWAYS log on the server via `error_log()`. NEVER use `console.error`/`console.warn` as application logging. The browser console is not a production logging surface.
 
 ---
 
@@ -64,7 +65,12 @@ Because `pls-notifications.js` is loaded with the `defer` attribute via `menu.ph
 ```php
 // Example: Safe Inline PHP Catch Block Generation
 catch (Throwable $e) {
-    $msgJson = json_encode('Errore: ' . $e->getMessage(), JSON_HEX_TAG | JSON_HEX_AMP | JSON_HEX_APOS | JSON_HEX_QUOT);
+    error_log(sprintf(
+        '[context_op] errore: %s | trace: %s',
+        $e->getMessage(),
+        $e->getTraceAsString()
+    ));
+    $msgJson = json_encode('Impossibile completare l\'operazione. Riprova più tardi.', JSON_HEX_TAG | JSON_HEX_AMP | JSON_HEX_APOS | JSON_HEX_QUOT);
     echo "<script>
         document.addEventListener('DOMContentLoaded', function() {
             showNotification('error', {$msgJson}, 0, true);
@@ -83,6 +89,72 @@ catch (Throwable $e) {
 
 ## 🚫 Absolute Constraints & Guardrails (Things to Never Do)
 
-* **NEVER** expose real exception messages (`$e->getMessage()`) directly to the user interface via `FlashMessage` or `showNotification` if they leak SQL queries, system paths, or internal logic. Log them via `error_log()` instead.
+* **NEVER** log technical details (`$e->getMessage()`, stack trace, SQL queries, file paths) in the user interface. → Always: `error_log($e->getMessage())` server-side + a static, user-friendly message in `FlashMessage`/`showNotification`.
+* **NEVER** use `console.error`/`console.warn` in **application code** as a logging mechanism. → The client is not a logging surface. The server logs via `error_log()` → CloudWatch. → (Exception: `console.*` inside the `pls-notifications.js` library itself, as internal diagnostics — this is library-level, not application-level.)
+* **NEVER** return `$e->getMessage()` raw in an API JSON response. → Log the exception server-side via `error_log()`, return a sanitized user-facing message. The client must never concatenate `data.error` / `responseJson.ErrorMessage` / `error.message` from a fetch into a `showNotification()`.
 * **NEVER** write `showNotification('success', 'Done'); window.location.reload();`. If a reload is mandatory, write `if (confirm('Done')) { window.location.reload(); }`.
 * **NEVER** add manual imports of `/js/pls-notifications.js` on pages that already include `menu.php`, as it is loaded automatically. Only add manual imports in standalone modules, popups, or custom layout files (e.g., `nomi.php`).
+
+---
+
+## 🔌 API Endpoint Contract: error response shape
+
+When a JSON endpoint catches an exception, the response body must contain **only** a user-facing message. The technical detail stays in the server log.
+
+```php
+// ❌ Anti-pattern: leaks SQL, paths, internals to the client
+} catch (Exception $e) {
+    echo json_encode(['error' => $e->getMessage()]);
+}
+
+// ✅ Correct pattern
+} catch (Exception $e) {
+    error_log(sprintf(
+        '[endpoint_name] %s | trace: %s',
+        $e->getMessage(),
+        $e->getTraceAsString()
+    ));
+    http_response_code(500);
+    echo json_encode(['error' => 'Impossibile completare l\'operazione. Riprova più tardi.']);
+}
+```
+
+On the client side, never concatenate the server's `error` field directly into a user notification:
+
+```javascript
+// ❌ Anti-pattern
+showNotification('error', `Errore: ${data.error}`, 0, true);
+
+// ✅ Correct pattern
+showNotification('error', 'Impossibile completare l\'operazione. Riprova più tardi.', 0, true);
+```
+
+If the endpoint returns a custom field (e.g. `ErrorMessage`), the field must already be sanitized on the server. The client treats it as opaque text and renders it as-is only if it's known to be safe (e.g. user-facing strings from a curated list).
+
+---
+
+## 🔒 Logging Principles (Opzione A — server is the only logging surface)
+
+The **server is the single source of truth for logging.** This is by design and aligned with the centralized observability stack (`error_log` → CloudWatch via Docker).
+
+* **PHP backend**: use `error_log($message)`. Always include context (endpoint name, IDs, request parameters) so CloudWatch queries are actionable.
+* **JavaScript client**: do NOT log via `console.error` / `console.warn` / `console.log` for application errors. The browser console is a developer tool, not a production logging surface — it doesn't reach CloudWatch, doesn't survive page close, isn't correlated with backend traces.
+  * When a client-side error occurs, the **server** is the one that should know about it (it has the request context, session, and correlation IDs). The client just shows a sanitized message.
+  * Library-internal `console.*` (e.g., `pls-notifications.js` bootstrap init diagnostics) is an exception: it's not application error logging, it's library-level introspection.
+
+**Consequence for catch blocks (JS):**
+
+```javascript
+// ❌ Anti-pattern: the technical error vanishes into the browser console
+} catch (error) {
+    console.error("Errore calcolo CF:", error);
+    showNotification('error', 'Impossibile calcolare il codice fiscale.');
+}
+
+// ✅ Correct pattern: the server has the context; the client just notifies
+} catch (error) {
+    showNotification('error', 'Impossibile calcolare il codice fiscale.');
+}
+```
+
+If a particular client error must be tracked, the fix is at the server endpoint that originated the error (where the exception can be logged with full context), not at the client.
