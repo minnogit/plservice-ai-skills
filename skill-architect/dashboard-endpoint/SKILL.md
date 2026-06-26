@@ -63,7 +63,8 @@ RedisManager::del(string $key): int
 ### 3. Organizzazione del codice
 
 - Usare servizi dal **container PHP-DI** (`get_container_instance()` + `$container->get(Classe::class)`), non query SQL direttamente nell'endpoint
-- `try-catch` solo sulla **business logic**, non sulla lettura cache
+- `try-catch` avvolge **business logic + container resolution**. La lettura cache è prima del `try` perché `RedisManager` è già fail-safe
+- `$container` e `$service` vanno **DENTRO** il `try-catch`, non prima: un errore del container deve produrre un JSON valido
 
 ### 4. TTL
 
@@ -116,10 +117,9 @@ if (($cached = RedisManager::get($cacheKey)) !== false) {
 }
 
 // 2. Business logic
-$container = get_container_instance();
-$service = $container->get(Classe::class);
-
 try {
+    $container = get_container_instance();
+    $service = $container->get(Classe::class);
     $result = $service->metodo();
 } catch (Throwable $e) {
     http_response_code(500);
@@ -168,12 +168,11 @@ if (($cached = RedisManager::get($cacheKey)) !== false) {
 }
 
 // 2. Business logic
-$container = get_container_instance();
-$service = $container->get(Classe::class);
-
 try {
+    $container = get_container_instance();
+    $service = $container->get(Classe::class);
     $data = $service->metodo();
-    $result = ['chiave' => $data, 'altra_chiave' => $valore];
+    $result = ['chiave' => $data];
 } catch (Throwable $e) {
     http_response_code(500);
     error_log((string) $e);
